@@ -168,12 +168,6 @@ jobs:
         env:
           ACCOUNT1_EMAIL: ${{ secrets.ACCOUNT1_EMAIL }}
           ACCOUNT1_PASSWORD: ${{ secrets.ACCOUNT1_PASSWORD }}
-          ACCOUNT2_EMAIL: ${{ secrets.ACCOUNT2_EMAIL }}
-          ACCOUNT2_PASSWORD: ${{ secrets.ACCOUNT2_PASSWORD }}
-          ACCOUNT3_EMAIL: ${{ secrets.ACCOUNT3_EMAIL }}
-          ACCOUNT3_PASSWORD: ${{ secrets.ACCOUNT3_PASSWORD }}
-          ACCOUNT4_EMAIL: ${{ secrets.ACCOUNT4_EMAIL }}
-          ACCOUNT4_PASSWORD: ${{ secrets.ACCOUNT4_PASSWORD }}
 
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
