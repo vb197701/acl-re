@@ -1,8 +1,8 @@
-name: auto run 
+name: auto run
 
 on:
   schedule:
-    - cron: '0 2 * * *'   # 每天 UTC 2:00（北京时间 10:00）
+    - cron: '0 2 * * *' # 每天 UTC 2:00（北京时间 10:00）
   workflow_dispatch:
     inputs:
       enable_video:
@@ -13,6 +13,18 @@ on:
         options:
           - 'false'
           - 'true'
+      force_run:
+        description: '忽略 next_run.txt 强制执行'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+concurrency:
+  group: aclclouds-renew
+  cancel-in-progress: false
 
 jobs:
   renew:
@@ -20,83 +32,217 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
-      contents: read
-    timeout-minutes: 30
+      contents: write
+    timeout-minutes: 40
+
+    env:
+      PYTHONUNBUFFERED: '1'
+      PROXY_SERVER: socks5://127.0.0.1:10808
+      RENEW_THRESHOLD_DAYS: '2'
+      NEXT_RUN_FILE: next_run.txt
 
     steps:
       - name: 拉取仓库
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 安装依赖
+      - name: 检查 next_run.txt
+        id: gate
+        shell: bash
         run: |
+          set -euo pipefail
+
+          FORCE_RUN="${{ github.event.inputs.force_run || 'false' }}"
+          NOW_EPOCH="$(date -u +%s)"
+
+          echo "当前 UTC 时间: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+          if [[ "$FORCE_RUN" == "true" ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "reason=force_run" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ ! -f "$NEXT_RUN_FILE" ]]; then
+            echo "未发现 $NEXT_RUN_FILE，继续执行。"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "reason=file_missing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RAW_NEXT="$(tr -d '\r\n' < "$NEXT_RUN_FILE" || true)"
+          if [[ -z "$RAW_NEXT" ]]; then
+            echo "$NEXT_RUN_FILE 为空，继续执行。"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "reason=file_empty" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NEXT_EPOCH="$(date -u -d "$RAW_NEXT" +%s 2>/dev/null || echo 0)"
+          if [[ "$NEXT_EPOCH" == "0" ]]; then
+            echo "$NEXT_RUN_FILE 内容无法解析：$RAW_NEXT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "reason=parse_failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "next_run.txt = $RAW_NEXT"
+
+          if (( NOW_EPOCH < NEXT_EPOCH )); then
+            echo "未到续期检查时间，跳过执行。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "reason=not_due" >> "$GITHUB_OUTPUT"
+          else
+            echo "已到续期检查时间，继续执行。"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "reason=due" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装系统依赖
+        if: steps.gate.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl wget unzip jq ca-certificates gnupg lsb-release
+
+      - name: 安装 Python 依赖
+        if: steps.gate.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
           pip install -r requirements.txt
           playwright install chromium --with-deps
 
-      - name: 下载并启动 Xray 代理
+      - name: 安装并启动 Cloudflare WARP SOCKS5
+        if: steps.gate.outputs.skip != 'true'
         env:
-          V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
+          WARP_PLUS_LICENSE: ${{ secrets.WARP_PLUS_LICENSE }}
+        shell: bash
         run: |
-          curl -sL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
-          unzip xray.zip && chmod +x xray
-          echo "$V2RAY_CONFIG" > config.json
-          ./xray run -c config.json &
-          sleep 5
+          set -euo pipefail
+
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp
+
+          sudo warp-cli --accept-tos registration new
+          if [[ -n "${WARP_PLUS_LICENSE:-}" ]]; then
+            sudo warp-cli --accept-tos registration license "$WARP_PLUS_LICENSE" || true
+          fi
+
+          sudo warp-cli --accept-tos mode proxy
+          sudo warp-cli --accept-tos proxy port 10808
+          sudo warp-cli --accept-tos connect
+
+          for i in {1..20}; do
+            STATUS="$(sudo warp-cli --accept-tos status || true)"
+            echo "$STATUS"
+            if echo "$STATUS" | grep -qi "Connected"; then
+              break
+            fi
+            sleep 2
+          done
+
           echo "直连 IP："
-          curl -s --max-time 5 ifconfig.me
-          echo ""
-          echo "代理 IP："
-          curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me
+          curl -s --max-time 10 ifconfig.me || true
           echo ""
 
-      - name: 运行续期脚本（多账号）
+          echo "代理 IP："
+          curl -s --max-time 15 --socks5-hostname 127.0.0.1:10808 ifconfig.me || true
+          echo ""
+
+      - name: 运行续期脚本
+        if: steps.gate.outputs.skip != 'true'
         env:
-          # ── 账号1（必填） ──────────────────────────────
-          ACCOUNT1_EMAIL:    ${{ secrets.ACCOUNT1_EMAIL }}
+          ACCOUNT1_EMAIL: ${{ secrets.ACCOUNT1_EMAIL }}
           ACCOUNT1_PASSWORD: ${{ secrets.ACCOUNT1_PASSWORD }}
-          # ── 账号2（选填，留空则跳过） ──────────────────
-          ACCOUNT2_EMAIL:    ${{ secrets.ACCOUNT2_EMAIL }}
+          ACCOUNT2_EMAIL: ${{ secrets.ACCOUNT2_EMAIL }}
           ACCOUNT2_PASSWORD: ${{ secrets.ACCOUNT2_PASSWORD }}
-          # ── 账号3（选填，留空则跳过） ──────────────────
-          ACCOUNT3_EMAIL:    ${{ secrets.ACCOUNT3_EMAIL }}
+          ACCOUNT3_EMAIL: ${{ secrets.ACCOUNT3_EMAIL }}
           ACCOUNT3_PASSWORD: ${{ secrets.ACCOUNT3_PASSWORD }}
-          # ── 账号4（选填，留空则跳过） ──────────────────
-          ACCOUNT4_EMAIL:    ${{ secrets.ACCOUNT4_EMAIL }}
+          ACCOUNT4_EMAIL: ${{ secrets.ACCOUNT4_EMAIL }}
           ACCOUNT4_PASSWORD: ${{ secrets.ACCOUNT4_PASSWORD }}
-          # ── 推送配置（全局共用） ───────────────────────
-          TG_BOT_TOKEN:      ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:        ${{ secrets.TG_CHAT_ID }}
+
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           WXPUSHER_APPTOKEN: ${{ secrets.WXPUSHER_APPTOKEN }}
-          WXPUSHER_UID:      ${{ secrets.WXPUSHER_UID }}
-          # ── 录屏：手动触发时可选，schedule 默认 false ─
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+
           ENABLE_VIDEO: ${{ github.event.inputs.enable_video || 'false' }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        shell: bash
         run: |
+          set -euo pipefail
           python renew.py 2>&1 | tee renew.log
+
+      - name: 未到时间时写日志
+        if: steps.gate.outputs.skip == 'true'
+        shell: bash
+        run: |
+          echo "本次运行已跳过，原因：${{ steps.gate.outputs.reason }}"
+
+      - name: 提交 next_run.txt
+        if: always() && steps.gate.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "$NEXT_RUN_FILE" ]]; then
+            echo "未生成 $NEXT_RUN_FILE，跳过提交。"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$NEXT_RUN_FILE"
+          git diff --cached --quiet && {
+            echo "next_run.txt 无变更，无需提交。"
+            exit 0
+          }
+
+          git commit -m "chore: update next_run.txt"
+          git push
 
       - name: 上传截图和录屏
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: aclclouds-debug
-          path: screenshots/
+          path: |
+            screenshots/
+            renew.log
+            next_run.txt
+          if-no-files-found: ignore
           retention-days: 3
 
       - name: 删除当前 workflow 的旧 runs（保留最近 2 个）
-        if: always()
+        if: always() && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
           WORKFLOW_ID=$(gh api repos/${{ github.repository }}/actions/workflows \
             --jq '.workflows[] | select(.name == "${{ github.workflow }}") | .id')
           echo "Workflow ID: $WORKFLOW_ID"
+
           gh api "repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs" \
             --paginate \
             --jq '.workflow_runs[2:][] | .id' \
-            | while read id; do
-                echo "Deleting run $id"
-                gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id"
-              done
+          | while read -r id; do
+              echo "Deleting run $id"
+              gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id"
+            done
