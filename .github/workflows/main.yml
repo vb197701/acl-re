@@ -1,0 +1,102 @@
+name: auto run 
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # 每天 UTC 2:00（北京时间 10:00）
+  workflow_dispatch:
+    inputs:
+      enable_video:
+        description: '是否开启录屏'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  renew:
+    name: 执行续期检测
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    timeout-minutes: 30
+
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: 下载并启动 Xray 代理
+        env:
+          V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
+        run: |
+          curl -sL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
+          unzip xray.zip && chmod +x xray
+          echo "$V2RAY_CONFIG" > config.json
+          ./xray run -c config.json &
+          sleep 5
+          echo "直连 IP："
+          curl -s --max-time 5 ifconfig.me
+          echo ""
+          echo "代理 IP："
+          curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me
+          echo ""
+
+      - name: 运行续期脚本（多账号）
+        env:
+          # ── 账号1（必填） ──────────────────────────────
+          ACCOUNT1_EMAIL:    ${{ secrets.ACCOUNT1_EMAIL }}
+          ACCOUNT1_PASSWORD: ${{ secrets.ACCOUNT1_PASSWORD }}
+          # ── 账号2（选填，留空则跳过） ──────────────────
+          ACCOUNT2_EMAIL:    ${{ secrets.ACCOUNT2_EMAIL }}
+          ACCOUNT2_PASSWORD: ${{ secrets.ACCOUNT2_PASSWORD }}
+          # ── 账号3（选填，留空则跳过） ──────────────────
+          ACCOUNT3_EMAIL:    ${{ secrets.ACCOUNT3_EMAIL }}
+          ACCOUNT3_PASSWORD: ${{ secrets.ACCOUNT3_PASSWORD }}
+          # ── 账号4（选填，留空则跳过） ──────────────────
+          ACCOUNT4_EMAIL:    ${{ secrets.ACCOUNT4_EMAIL }}
+          ACCOUNT4_PASSWORD: ${{ secrets.ACCOUNT4_PASSWORD }}
+          # ── 推送配置（全局共用） ───────────────────────
+          TG_BOT_TOKEN:      ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:        ${{ secrets.TG_CHAT_ID }}
+          WXPUSHER_APPTOKEN: ${{ secrets.WXPUSHER_APPTOKEN }}
+          WXPUSHER_UID:      ${{ secrets.WXPUSHER_UID }}
+          # ── 录屏：手动触发时可选，schedule 默认 false ─
+          ENABLE_VIDEO: ${{ github.event.inputs.enable_video || 'false' }}
+        run: |
+          python renew.py 2>&1 | tee renew.log
+
+      - name: 上传截图和录屏
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aclclouds-debug
+          path: screenshots/
+          retention-days: 3
+
+      - name: 删除当前 workflow 的旧 runs（保留最近 2 个）
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          WORKFLOW_ID=$(gh api repos/${{ github.repository }}/actions/workflows \
+            --jq '.workflows[] | select(.name == "${{ github.workflow }}") | .id')
+          echo "Workflow ID: $WORKFLOW_ID"
+          gh api "repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs" \
+            --paginate \
+            --jq '.workflow_runs[2:][] | .id' \
+            | while read id; do
+                echo "Deleting run $id"
+                gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id"
+              done
