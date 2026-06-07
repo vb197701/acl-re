@@ -47,10 +47,26 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: 拉取私库
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO_NAME }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: private_code
+          fetch-depth: 1
+
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: 检查私库文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f private_code/renew.py
+          test -f private_code/requirements.txt
+          echo "私库脚本检查通过"
 
       - name: 检查 next_run.txt
         id: gate
@@ -64,6 +80,7 @@ jobs:
           echo "当前 UTC 时间: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
           if [[ "$FORCE_RUN" == "true" ]]; then
+            echo "手动强制执行，跳过 next_run.txt 时间门禁。"
             echo "skip=false" >> "$GITHUB_OUTPUT"
             echo "reason=force_run" >> "$GITHUB_OUTPUT"
             exit 0
@@ -117,7 +134,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pip install -r requirements.txt
+          pip install -r private_code/requirements.txt
           playwright install chromium --with-deps
 
       - name: 安装并启动 Cloudflare WARP SOCKS5
@@ -137,7 +154,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cloudflare-warp
 
-          sudo warp-cli --accept-tos registration new
+          sudo warp-cli --accept-tos registration new || true
           if [[ -n "${WARP_PLUS_LICENSE:-}" ]]; then
             sudo warp-cli --accept-tos registration license "$WARP_PLUS_LICENSE" || true
           fi
@@ -163,7 +180,7 @@ jobs:
           curl -s --max-time 15 --socks5-hostname 127.0.0.1:10808 ifconfig.me || true
           echo ""
 
-      - name: 运行续期脚本
+      - name: 运行私库 renew.py
         if: steps.gate.outputs.skip != 'true'
         env:
           ACCOUNT1_EMAIL: ${{ secrets.ACCOUNT1_EMAIL }}
@@ -171,15 +188,17 @@ jobs:
 
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          WXPUSHER_APPTOKEN: ${{ secrets.WXPUSHER_APPTOKEN }}
-          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
 
           ENABLE_VIDEO: ${{ github.event.inputs.enable_video || 'false' }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
+
+          PROXY_SERVER: socks5://127.0.0.1:10808
+          RENEW_THRESHOLD_DAYS: '2'
+          NEXT_RUN_FILE: next_run.txt
         shell: bash
         run: |
           set -euo pipefail
-          python renew.py 2>&1 | tee renew.log
+          python private_code/renew.py 2>&1 | tee renew.log
 
       - name: 未到时间时写日志
         if: steps.gate.outputs.skip == 'true'
@@ -187,7 +206,7 @@ jobs:
         run: |
           echo "本次运行已跳过，原因：${{ steps.gate.outputs.reason }}"
 
-      - name: 提交 next_run.txt
+      - name: 提交 next_run.txt 到当前仓库（B）
         if: always() && steps.gate.outputs.skip != 'true'
         shell: bash
         run: |
@@ -210,7 +229,7 @@ jobs:
           git commit -m "chore: update next_run.txt"
           git push
 
-      - name: 上传截图和录屏
+      - name: 上传截图、日志和 next_run.txt
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -229,6 +248,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           WORKFLOW_ID=$(gh api repos/${{ github.repository }}/actions/workflows \
             --jq '.workflows[] | select(.name == "${{ github.workflow }}") | .id')
           echo "Workflow ID: $WORKFLOW_ID"
