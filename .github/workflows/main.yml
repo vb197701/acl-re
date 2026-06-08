@@ -14,7 +14,7 @@ on:
           - 'false'
           - 'true'
       force_run:
-        description: '忽略 next_run.txt 强制执行'
+        description: '强制所有账号执行，忽略 next_run_account*.txt'
         required: false
         default: 'false'
         type: choice
@@ -23,7 +23,7 @@ on:
           - 'true'
 
 concurrency:
-  group: aclclouds-renew
+  group: acl-renew
   cancel-in-progress: false
 
 jobs:
@@ -39,15 +39,14 @@ jobs:
       PYTHONUNBUFFERED: '1'
       PROXY_SERVER: socks5://127.0.0.1:10808
       RENEW_THRESHOLD_DAYS: '2'
-      NEXT_RUN_FILE: next_run.txt
 
     steps:
-      - name: 拉取仓库
+      - name: 拉取当前仓库（B）
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 拉取私库
+      - name: 拉取私库脚本（A）
         uses: actions/checkout@v4
         with:
           repository: ${{ secrets.PRIVATE_REPO_NAME }}
@@ -68,61 +67,15 @@ jobs:
           test -f private_code/requirements.txt
           echo "私库脚本检查通过"
 
-      - name: 检查 next_run.txt
-        id: gate
+      - name: 手动强制执行时清理账号状态文件
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.force_run == 'true'
         shell: bash
         run: |
           set -euo pipefail
-
-          FORCE_RUN="${{ github.event.inputs.force_run || 'false' }}"
-          NOW_EPOCH="$(date -u +%s)"
-
-          echo "当前 UTC 时间: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-
-          if [[ "$FORCE_RUN" == "true" ]]; then
-            echo "手动强制执行，跳过 next_run.txt 时间门禁。"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "reason=force_run" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [[ ! -f "$NEXT_RUN_FILE" ]]; then
-            echo "未发现 $NEXT_RUN_FILE，继续执行。"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "reason=file_missing" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          RAW_NEXT="$(tr -d '\r\n' < "$NEXT_RUN_FILE" || true)"
-          if [[ -z "$RAW_NEXT" ]]; then
-            echo "$NEXT_RUN_FILE 为空，继续执行。"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "reason=file_empty" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          NEXT_EPOCH="$(date -u -d "$RAW_NEXT" +%s 2>/dev/null || echo 0)"
-          if [[ "$NEXT_EPOCH" == "0" ]]; then
-            echo "$NEXT_RUN_FILE 内容无法解析：$RAW_NEXT"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "reason=parse_failed" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "next_run.txt = $RAW_NEXT"
-
-          if (( NOW_EPOCH < NEXT_EPOCH )); then
-            echo "未到续期检查时间，跳过执行。"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "reason=not_due" >> "$GITHUB_OUTPUT"
-          else
-            echo "已到续期检查时间，继续执行。"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "reason=due" >> "$GITHUB_OUTPUT"
-          fi
+          rm -f next_run_account*.txt
+          echo "已清理 next_run_account*.txt，本次将强制所有账号执行"
 
       - name: 安装系统依赖
-        if: steps.gate.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -130,7 +83,6 @@ jobs:
           sudo apt-get install -y curl wget unzip jq ca-certificates gnupg lsb-release
 
       - name: 安装 Python 依赖
-        if: steps.gate.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -138,7 +90,6 @@ jobs:
           playwright install chromium --with-deps
 
       - name: 安装并启动 Cloudflare WARP SOCKS5
-        if: steps.gate.outputs.skip != 'true'
         env:
           WARP_PLUS_LICENSE: ${{ secrets.WARP_PLUS_LICENSE }}
         shell: bash
@@ -181,7 +132,6 @@ jobs:
           echo ""
 
       - name: 运行私库 renew.py
-        if: steps.gate.outputs.skip != 'true'
         env:
           ACCOUNT1_EMAIL: ${{ secrets.ACCOUNT1_EMAIL }}
           ACCOUNT1_PASSWORD: ${{ secrets.ACCOUNT1_PASSWORD }}
@@ -196,50 +146,48 @@ jobs:
 
           PROXY_SERVER: socks5://127.0.0.1:10808
           RENEW_THRESHOLD_DAYS: '2'
-          NEXT_RUN_FILE: next_run.txt
         shell: bash
         run: |
           set -euo pipefail
           python private_code/renew.py 2>&1 | tee renew.log
 
-      - name: 未到时间时写日志
-        if: steps.gate.outputs.skip == 'true'
+      - name: 打印生成文件列表
+        if: always()
         shell: bash
         run: |
-          echo "本次运行已跳过，原因：${{ steps.gate.outputs.reason }}"
+          echo "==== next_run_account files ===="
+          ls -la next_run_account*.txt 2>/dev/null || true
+          echo "==== screenshots files ===="
+          find screenshots -maxdepth 2 -type f 2>/dev/null | sort || true
 
-      - name: 提交 next_run.txt 到当前仓库（B）
-        if: always() && steps.gate.outputs.skip != 'true'
+      - name: 提交账号状态文件到当前仓库（B）
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ ! -f "$NEXT_RUN_FILE" ]]; then
-            echo "未生成 $NEXT_RUN_FILE，跳过提交。"
-            exit 0
-          fi
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add "$NEXT_RUN_FILE"
+          git add next_run_account*.txt 2>/dev/null || true
+
           git diff --cached --quiet && {
-            echo "next_run.txt 无变更，无需提交。"
+            echo "账号状态文件无变更，无需提交。"
             exit 0
           }
 
-          git commit -m "chore: update next_run.txt"
+          git commit -m "chore: update account next_run files"
           git push
 
-      - name: 上传截图、日志和 next_run.txt
+      - name: 上传截图、日志和账号状态文件
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: aclclouds-debug
+          name: acl-debug
           path: |
             screenshots/
             renew.log
-            next_run.txt
+            next_run_account*.txt
           if-no-files-found: ignore
           retention-days: 3
 
